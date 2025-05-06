@@ -78,15 +78,104 @@ If you're hitting Let's Encrypt rate limits, use the staging environment:
 devsnek --host example.com --port 8443 --staging
 ```
 
+### Key Authorization Mismatch
+
+If you see errors containing "key authorization did not match", this typically indicates:
+
+1. **DNS Configuration Issues**: Your domain might not be pointing to the correct IP address.
+   
+   Enable verbose mode to use the built-in DNS validation tool:
+   ```bash
+   devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --verbose
+   ```
+   
+   The enhanced DNS validation will:
+   - Determine your server's public IP from multiple sources
+   - Check if your domain correctly resolves to your server's IP
+   - Detect CDNs or proxies like Cloudflare
+   - Provide specific troubleshooting guidance
+   
+   You can also manually check:
+   ```bash
+   # Check where your domain resolves to
+   dig +short example.com
+   
+   # Compare with your server's public IP
+   curl https://api.ipify.org
+   ```
+
+2. **CDN or Proxy Issues**: If your domain uses Cloudflare or another CDN/proxy, the HTTP challenge will fail.
+   - The verbose output will detect common CDN IP ranges
+   - Temporarily disable the CDN/proxy for the domain during certificate issuance
+   - Or use the DNS-01 challenge method (not currently supported by devsnek)
+
+3. **Proxy/Firewall Issues**: Something might be intercepting or modifying the challenge responses.
+   - Check if your CDN, firewall, or proxy is configured to pass through requests to `/.well-known/acme-challenge/`
+   - Temporarily disable any firewall rules that might affect HTTP traffic
+
+### Certificate Verification Failed
+
+If you see "Certificate verification failed" errors:
+
+1. **Check certificate and key file permissions**:
+   ```bash
+   ls -la certs/
+   # Ensure files are readable
+   chmod 644 certs/*.crt
+   chmod 600 certs/*.key
+   ```
+
+2. **Verify the certificate chain is complete**:
+   ```bash
+   openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt certs/yourdomain.crt
+   ```
+
+3. **Ensure the certificate matches the private key**:
+   ```bash
+   # Get the modulus of the certificate and key
+   openssl x509 -noout -modulus -in certs/yourdomain.crt | openssl md5
+   openssl rsa -noout -modulus -in certs/yourdomain.key | openssl md5
+   # The output should be identical
+   ```
+
 ## Network and Port Issues
 
 ### Port Already in Use
 
-If you get an error that the port is already in use:
+#### HTTPS Port Conflicts
+
+If you get an error that the HTTPS port is already in use:
 ```bash
 # Try a different port
 devsnek --host example.com --port 8444
 ```
+
+Or find and stop the process using the port:
+```bash
+# Find process using port 8443
+sudo lsof -i :8443
+# Kill the process
+sudo kill <PID>
+```
+
+#### HTTP Redirection Port Conflicts
+
+For HTTP redirection port conflicts, devsnek now implements automatic port fallback:
+
+1. If the requested HTTP port (default 8080) is already in use, devsnek will:
+   - Automatically search for the next available port
+   - Display a message showing which port was chosen
+   - Continue operation without requiring manual intervention
+
+2. You can still specify a custom HTTP port if needed:
+   ```bash
+   devsnek --host example.com --port 8443 --http-port 8081
+   ```
+
+3. Or disable HTTP redirection entirely:
+   ```bash
+   devsnek --host example.com --port 8443 --no-redirect
+   ```
 
 ### Permission Issues with Port 80 or 443
 
@@ -98,6 +187,20 @@ sudo devsnek --host example.com --port 443 --redirect-port 80
 Alternatively, use higher ports:
 ```bash
 devsnek --host example.com --port 8443 --redirect-port 8080
+```
+
+### Binding to Public Interfaces
+
+If you need to make your server accessible from other machines:
+```bash
+# Use 0.0.0.0 to listen on all interfaces
+devsnek --bind-addr 0.0.0.0 --port 8443 --self-signed
+```
+
+For a specific interface only:
+```bash
+# Replace with your network interface's IP
+devsnek --bind-addr 192.168.1.10 --port 8443 --self-signed
 ```
 
 ## ASGI Application Issues
@@ -122,6 +225,29 @@ cd myproject
 devsnek --host example.com --port 8443 --asgi-app app:app
 ```
 
+### ASGI Application Errors
+
+If your ASGI application fails to start:
+
+1. **Check for syntax errors in your application**:
+   ```bash
+   python -m myapp
+   ```
+
+2. **Add debugging output**:
+   ```bash
+   devsnek --host localhost --port 8443 --self-signed --asgi-app app:app --log-level DEBUG
+   ```
+
+3. **Test the ASGI app with a standard ASGI server**:
+   ```bash
+   # For FastAPI/Starlette apps
+   uvicorn app:app --reload
+   
+   # For Django apps
+   daphne myproject.asgi:application
+   ```
+
 ## Development Workflow Tips
 
 ### Quick Local Development
@@ -144,6 +270,25 @@ For production or staging environments:
 ```bash
 devsnek --host example.com --port 443 --email admin@example.com --redirect-port 80
 ```
+
+### Live Reloading Issues
+
+If live reloading isn't working correctly:
+
+1. **Specify directories to watch explicitly**:
+   ```bash
+   devsnek --host localhost --port 8443 --self-signed --asgi-app app:app --reload-dir ./src --reload-dir ./templates
+   ```
+
+2. **Check if your directories are being watched**:
+   ```bash
+   devsnek --host localhost --port 8443 --self-signed --asgi-app app:app --log-level DEBUG
+   ```
+   
+   Look for log messages about file watching.
+
+3. **Ensure your ASGI application supports reloading**:
+   Some frameworks might need additional configuration for reloading to work correctly.
 
 ## Example Configurations
 
@@ -186,3 +331,29 @@ Run with:
 ```bash
 devsnek --config config.yaml
 ```
+
+## WebSocket Issues
+
+If you're having trouble with WebSocket connections:
+
+1. **Check browser console for WebSocket errors**
+   Look for connection errors or protocol issues in your browser's developer tools.
+
+2. **Ensure your ASGI application properly handles WebSocket protocol**
+   ```python
+   # Example for FastAPI
+   @app.websocket("/ws")
+   async def websocket_endpoint(websocket: WebSocket):
+       await websocket.accept()
+       # ...
+   ```
+
+3. **Try with WebSocket support explicitly enabled**
+   ```bash
+   devsnek --host localhost --port 8443 --self-signed --asgi-app app:app
+   ```
+
+4. **Debug with verbose logging**
+   ```bash
+   devsnek --host localhost --port 8443 --self-signed --asgi-app app:app --log-level DEBUG
+   ```

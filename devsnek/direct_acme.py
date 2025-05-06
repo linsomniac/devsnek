@@ -136,10 +136,30 @@ class ACMEClient:
             key_data = f.read()
         return load_pem_private_key(key_data, password=None)
 
-    def jws_sign(self, key, url: str, payload: Dict[str, Any], nonce: str) -> Dict[str, Any]:
-        """Create a JWS signed request."""
-        if not isinstance(payload, bytes):
-            payload = json.dumps(payload).encode('utf8')
+    def jws_sign(self, key, url: str, payload: Dict[str, Any], nonce: str, post_as_get: bool = False) -> Dict[str, Any]:
+        """
+        Create a JWS signed request.
+        
+        Args:
+            key: The private key to sign with
+            url: The URL for the request
+            payload: The payload (or empty dict for POST-as-GET)
+            nonce: The nonce to use
+            post_as_get: Whether this is a POST-as-GET request
+            
+        Returns:
+            A JWS signed request
+        """
+        # For POST-as-GET requests, we need to use an empty string payload, not an empty JSON object
+        if post_as_get:
+            payload_str = ""
+            payload_bytes = b""
+        elif not isinstance(payload, bytes):
+            payload_str = json.dumps(payload)
+            payload_bytes = payload_str.encode('utf8')
+        else:
+            payload_bytes = payload
+            payload_str = payload.decode('utf8')
             
         protected = {
             "alg": "RS256",
@@ -152,7 +172,7 @@ class ACMEClient:
             # For new-acct, include the JWK (public key)
             jwk = {
                 "kty": "RSA",
-                "n": b64(key.public_key().public_numbers().n.to_bytes(256, 'big').lstrip(b'\x00')),
+                "n": b64(key.public_key().public_numbers().n.to_bytes((key.public_key().public_numbers().n.bit_length() + 7) // 8, byteorder='big').lstrip(b'\x00')),
                 "e": b64(key.public_key().public_numbers().e.to_bytes(3, 'big').lstrip(b'\x00')),
             }
             protected["jwk"] = jwk
@@ -161,11 +181,18 @@ class ACMEClient:
             protected["kid"] = self.account_url
         
         protected_b64 = b64(json.dumps(protected).encode('utf8'))
-        payload_b64 = b64(payload)
+        
+        # For POST-as-GET requests, use an empty string for the payload
+        if post_as_get:
+            payload_b64 = ""
+            signature_input = f"{protected_b64}.".encode('utf8')
+        else:
+            payload_b64 = b64(payload_bytes)
+            signature_input = f"{protected_b64}.{payload_b64}".encode('utf8')
         
         # Create the signature
         signature_bytes = key.sign(
-            f"{protected_b64}.{payload_b64}".encode('utf8'),
+            signature_input,
             padding.PKCS1v15(),
             hashes.SHA256()
         )
@@ -243,6 +270,9 @@ class ACMEClient:
         order_url = response.headers["Location"]
         order["url"] = order_url
         
+        # Store the order location for future reference
+        self.order_location = order_url
+        
         logger.info(f"Order created: {order_url}")
         logger.debug(f"Order details: {json.dumps(order, indent=2)}")
         return new_nonce, order
@@ -271,10 +301,10 @@ class ACMEClient:
         except Exception as e:
             logger.info(f"GET request failed: {e}, trying POST")
         
-        # Fall back to POST request with empty payload
+        # Fall back to POST-as-GET request
         response = self.session.post(
             auth_url,
-            json=self.jws_sign(key, auth_url, {}, nonce),
+            json=self.jws_sign(key, auth_url, {}, nonce, post_as_get=True),
             headers={"Content-Type": "application/jose+json"}
         )
         
@@ -391,7 +421,29 @@ class ACMEClient:
             for challenge in auth["challenges"]:
                 if challenge["type"] == "http-01":
                     token = challenge["token"]
-                    key_authorization = f"{token}.{b64(hashlib.sha256(key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.PKCS1)).digest())}"
+                    
+                    # Calculate the correct key authorization
+                    # First, we need to get the JWK thumbprint, which is standardized in RFC 7638
+                    jwk = {
+                        "kty": "RSA", 
+                        "n": b64(key.public_key().public_numbers().n.to_bytes((key.public_key().public_numbers().n.bit_length() + 7) // 8, byteorder="big").lstrip(b'\x00')),
+                        "e": b64(key.public_key().public_numbers().e.to_bytes(3, byteorder="big").lstrip(b'\x00'))
+                    }
+                    
+                    # JSON encode with sorted keys, no whitespace
+                    jwk_json = json.dumps(jwk, sort_keys=True, separators=(',', ':'))
+                    
+                    # Calculate SHA-256 hash and base64url encode
+                    jwk_thumbprint = b64(hashlib.sha256(jwk_json.encode('utf-8')).digest())
+                    
+                    # Construct key authorization
+                    key_authorization = f"{token}.{jwk_thumbprint}"
+                    
+                    # Log the key authorization for debugging
+                    logger.info(f"Token: {token}")
+                    logger.info(f"JWK JSON: {jwk_json}")
+                    logger.info(f"JWK Thumbprint: {jwk_thumbprint}")
+                    logger.info(f"Key Authorization: {key_authorization}")
                     
                     # Store the response
                     self.token_responses[token] = key_authorization
@@ -404,7 +456,7 @@ class ACMEClient:
                     challenge_url = challenge["url"]
                     response = self.session.post(
                         challenge_url,
-                        json=self.jws_sign(key, challenge_url, {}, new_nonce),
+                        json=self.jws_sign(key, challenge_url, {}, new_nonce, post_as_get=False),  # Regular POST
                         headers={"Content-Type": "application/jose+json"}
                     )
                     
@@ -417,6 +469,105 @@ class ACMEClient:
                     logger.info(f"Registered for challenge verification: {token}")
         
         return new_nonce
+
+    def check_domain_dns(self, domain: str) -> bool:
+        """
+        Perform comprehensive DNS checks for a domain.
+        
+        Args:
+            domain: The domain name to check
+            
+        Returns:
+            True if DNS appears to be correctly configured, False otherwise
+        """
+        try:
+            import socket
+            logger.info(f"Performing DNS checks for {domain}...")
+            
+            # Step 1: Get local IP addresses
+            local_ips = []
+            hostname = socket.gethostname()
+            try:
+                local_ips.append(socket.gethostbyname(hostname))
+                logger.info(f"Local hostname {hostname} resolves to: {local_ips[-1]}")
+            except Exception as e:
+                logger.warning(f"Could not resolve local hostname: {e}")
+            
+            # Step 2: Try to get public IP using multiple services for redundancy
+            public_ip = None
+            ip_services = [
+                'https://api.ipify.org',
+                'https://ifconfig.me/ip',
+                'https://icanhazip.com',
+                'https://ipecho.net/plain'
+            ]
+            
+            for service in ip_services:
+                try:
+                    with requests.get(service, timeout=3) as response:
+                        if response.status_code == 200:
+                            potential_ip = response.text.strip()
+                            # Validate this looks like an IP address
+                            try:
+                                socket.inet_aton(potential_ip)
+                                public_ip = potential_ip
+                                local_ips.append(public_ip)
+                                logger.info(f"Public IP detected: {public_ip} (via {service})")
+                                break
+                            except Exception:
+                                logger.warning(f"Invalid IP format received from {service}: {potential_ip}")
+                except Exception as e:
+                    logger.debug(f"Could not get public IP from {service}: {e}")
+            
+            if not public_ip:
+                logger.warning("Could not determine public IP address")
+            
+            # Step 3: Check DNS resolution for the domain
+            try:
+                logger.info(f"Looking up DNS records for {domain}...")
+                
+                # Try A record resolution
+                try:
+                    domain_ips = socket.gethostbyname_ex(domain)[2]
+                    logger.info(f"Domain {domain} resolves to: {domain_ips}")
+                    
+                    # Check if any local IPs match the domain IPs
+                    matches = set(local_ips).intersection(set(domain_ips))
+                    if matches:
+                        logger.info(f"✓ Domain correctly points to this server ({matches})")
+                        return True
+                    elif public_ip:
+                        logger.warning(f"✗ Domain does not point to this server's public IP")
+                        logger.warning(f"  Your public IP: {public_ip}")
+                        logger.warning(f"  Domain IPs: {domain_ips}")
+                        logger.warning(f"  The Let's Encrypt validation will likely fail!")
+                        
+                        # Check if the domain might be behind a proxy/CDN
+                        if any(ip.startswith(('104.16.', '104.17.', '104.18.', '172.64.', '104.21.', '104.22.')) for ip in domain_ips):
+                            logger.warning("⚠️ Your domain appears to be behind Cloudflare or another CDN/proxy")
+                            logger.warning("For Let's Encrypt validation to work with a CDN, you need to either:")
+                            logger.warning("1. Temporarily disable the CDN/proxy for this domain during certificate issuance")
+                            logger.warning("2. Use DNS-01 validation instead of HTTP-01 (not supported by this client yet)")
+                        
+                        return False
+                    else:
+                        logger.warning(f"? Cannot determine if domain points to this server (public IP unknown)")
+                        logger.warning(f"  Domain IPs: {domain_ips}")
+                        logger.warning(f"  Local IPs: {local_ips}")
+                        logger.warning(f"  The Let's Encrypt validation may fail unless this server is accessible via these IPs")
+                        return False
+                        
+                except Exception as e:
+                    logger.warning(f"Could not resolve A records for {domain}: {e}")
+                    return False
+                
+            except Exception as e:
+                logger.warning(f"Error checking DNS records: {e}")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"Error during DNS check: {e}")
+            return False
 
     def wait_for_authorizations(self, key, auth_url_list: List[str], nonce: str) -> str:
         """Wait for all authorizations to be valid."""
@@ -437,10 +588,79 @@ class ACMEClient:
                     time.sleep(5)
                 elif auth["status"] == "invalid":
                     logger.error(f"Authorization invalid. Checking challenges for errors...")
+                    
+                    # Check for common issues and provide helpful messages
+                    domain = auth.get('identifier', {}).get('value', 'unknown')
+                    challenge_errors = []
+                    
                     for challenge in auth.get("challenges", []):
                         if challenge.get("status") == "invalid":
-                            logger.error(f"Challenge failed: {challenge.get('error', {}).get('detail', 'Unknown error')}")
-                    raise ValueError(f"Authorization invalid: {auth_url}")
+                            error_detail = challenge.get('error', {}).get('detail', 'Unknown error')
+                            challenge_errors.append(error_detail)
+                            logger.error(f"Challenge failed: {error_detail}")
+                            
+                            # Extract validation records for debugging
+                            records = challenge.get('validationRecord', [])
+                            if records:
+                                for record in records:
+                                    if 'hostname' in record and 'addressesResolved' in record:
+                                        logger.error(f"DNS lookup: {record['hostname']} → {record['addressesResolved']}")
+                            
+                            # Check for key authorization mismatch
+                            if "key authorization" in error_detail and "did not match" in error_detail:
+                                logger.error("ERROR: Key authorization mismatch - this could indicate:")
+                                logger.error("1. Port 80 is being used by another service")
+                                logger.error("2. A proxy or firewall is interfering with the HTTP challenge")
+                                logger.error("3. DNS is not correctly configured for this domain")
+                                
+                                # Perform comprehensive DNS checks
+                                self.check_domain_dns(domain)
+                                
+                                # Also check if we can access our own HTTP challenge server
+                                for token in self.token_responses:
+                                    url = f"http://localhost/.well-known/acme-challenge/{token}"
+                                    try:
+                                        response = requests.get(url, timeout=2)
+                                        if response.status_code == 200:
+                                            logger.info(f"Local HTTP challenge server is accessible: {url}")
+                                            logger.info(f"Response: {response.text}")
+                                        else:
+                                            logger.error(f"Local HTTP challenge server returned status {response.status_code}: {url}")
+                                    except Exception as e:
+                                        logger.error(f"Could not access local HTTP challenge server: {e}")
+                                
+                            # Check for connection issues
+                            elif "connection" in error_detail.lower() or "timeout" in error_detail.lower():
+                                logger.error("ERROR: Connection issues - please check:")
+                                logger.error("1. Your domain's DNS is correctly pointing to this server's IP address")
+                                logger.error("2. Port 80 is open and accessible from the internet")
+                                logger.error("3. No firewalls are blocking incoming connections on port 80")
+                                
+                                # Perform comprehensive DNS checks
+                                self.check_domain_dns(domain)
+                                
+                                # Check port 80 accessibility
+                                logger.error("Checking if port 80 is open locally...")
+                                try:
+                                    import socket
+                                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                    s.settimeout(1)
+                                    result = s.connect_ex(('127.0.0.1', 80))
+                                    if result == 0:
+                                        logger.error("✓ Port 80 is open locally")
+                                    else:
+                                        logger.error(f"✗ Port 80 is not open locally (error code: {result})")
+                                    s.close()
+                                except Exception as e:
+                                    logger.error(f"Error checking port 80: {e}")
+                    
+                    # Provide final error message
+                    if challenge_errors:
+                        error_msg = f"Authorization for domain {domain} failed: {'; '.join(challenge_errors)}"
+                    else:
+                        error_msg = f"Authorization invalid: {auth_url}"
+                    
+                    raise ValueError(error_msg)
                 else:
                     logger.error(f"Authorization failed: {auth['status']}")
                     logger.error(json.dumps(auth, indent=2))
@@ -490,53 +710,266 @@ class ACMEClient:
     def wait_for_certificate(self, key, order: Dict[str, Any], nonce: str) -> Tuple[str, str]:
         """Wait for the certificate to be issued and download it."""
         new_nonce = nonce
-        order_url = order["url"]
+        max_attempts = 20  # More attempts for certificate processing
+        attempt = 0
+        certificate_url = None
+        
+        # Get order URL - either from the order object or by constructing a proper order URL
+        if "url" in order:
+            order_url = order["url"]
+        elif "finalize" in order:
+            # IMPORTANT: We can't just truncate the finalize URL, as the order URL has a different structure
+            # Instead, remember the location header from the original order creation
+            if hasattr(self, 'order_location') and self.order_location:
+                order_url = self.order_location
+                logger.info(f"Order URL not found, using stored order location: {order_url}")
+            else:
+                # Try to construct a proper order URL based on the finalize URL pattern
+                # For Let's Encrypt, the pattern is typically:
+                # finalize: https://acme-v02.api.letsencrypt.org/acme/finalize/account_id/order_id
+                # order: https://acme-v02.api.letsencrypt.org/acme/order/account_id/order_id
+                try:
+                    if "/finalize/" in order["finalize"]:
+                        parts = order["finalize"].split("/finalize/")
+                        if len(parts) == 2:
+                            base_url = parts[0]
+                            ids = parts[1]
+                            order_url = f"{base_url}/order/{ids}"
+                            logger.info(f"Order URL not found, constructed from finalize URL: {order_url}")
+                        else:
+                            raise ValueError("Cannot parse finalize URL correctly")
+                    else:
+                        raise ValueError("Finalize URL does not have expected format")
+                except Exception as e:
+                    logger.error(f"Error constructing order URL: {e}")
+                    raise ValueError(f"Cannot determine order URL from finalize URL: {order['finalize']}")
+        else:
+            raise ValueError("Cannot determine order URL - missing both 'url' and 'finalize' fields")
         
         # Poll the order URL until the status is 'valid'
-        while True:
-            response = self.session.post(
-                order_url,
-                json=self.jws_sign(key, order_url, {}, new_nonce),
-                headers={"Content-Type": "application/jose+json"}
-            )
+        while attempt < max_attempts:
+            attempt += 1
+            try:
+                response = self.session.post(
+                    order_url,
+                    json=self.jws_sign(key, order_url, {}, new_nonce, post_as_get=True),
+                    headers={"Content-Type": "application/jose+json"}
+                )
+                
+                if response.status_code != 200:
+                    logger.error(f"Order polling failed: {response.status_code}")
+                    logger.error(response.text)
+                    
+                    # Check for badNonce error
+                    try:
+                        error_data = response.json()
+                        if error_data.get("type") == "urn:ietf:params:acme:error:badNonce":
+                            logger.warning("Received badNonce error, getting fresh nonce")
+                            # Get a fresh nonce
+                            head_response = self.session.head(self.directory["newNonce"])
+                            new_nonce = head_response.headers["Replay-Nonce"]
+                            logger.info(f"Got fresh nonce: {new_nonce}")
+                            continue  # Retry immediately with new nonce
+                    except Exception:
+                        pass  # Fall through to standard retry logic
+                    
+                    # Let's Encrypt server might be having issues, retry with exponential backoff
+                    if attempt < max_attempts:
+                        sleep_time = min(5 * attempt, 30)  # Gradually increase wait time
+                        logger.info(f"Retrying in {sleep_time} seconds (attempt {attempt}/{max_attempts})")
+                        time.sleep(sleep_time)
+                        continue
+                    else:
+                        raise ValueError(f"Order polling failed after {max_attempts} attempts: {response.status_code}")
+                
+                new_nonce = response.headers["Replay-Nonce"]
+                order = response.json()
+                
+                # Print full order details to aid in debugging
+                logger.debug(f"Order details (attempt {attempt}): {json.dumps(order, indent=2)}")
+                
+                if order["status"] == "valid":
+                    if "certificate" in order:
+                        certificate_url = order["certificate"]
+                        logger.info(f"Certificate ready: {certificate_url}")
+                        break
+                    else:
+                        logger.warning(f"Order is valid but missing certificate URL in attempt {attempt}")
+                        # Some ACME servers might need an extra polling cycle to add the certificate URL
+                        time.sleep(2)
+                        continue
+                elif order["status"] == "processing":
+                    logger.info(f"Certificate processing, waiting (attempt {attempt}/{max_attempts})")
+                    time.sleep(5)
+                else:
+                    logger.error(f"Unexpected order status: {order['status']}")
+                    logger.error(json.dumps(order, indent=2))
+                    raise ValueError(f"Unexpected order status: {order['status']}")
             
-            if response.status_code != 200:
-                logger.error(f"Order polling failed: {response.status_code}")
-                logger.error(response.text)
-                raise ValueError(f"Order polling failed: {response.status_code}")
+            except Exception as e:
+                logger.error(f"Error polling order (attempt {attempt}/{max_attempts}): {e}")
+                if attempt < max_attempts:
+                    sleep_time = min(5 * attempt, 30)
+                    logger.info(f"Retrying in {sleep_time} seconds")
+                    time.sleep(sleep_time)
+                else:
+                    raise
+        
+        if certificate_url is None:
+            # Special case: some ACME servers don't include certificate URL in the order
+            # Instead of constructing the certificate URL which is unreliable,
+            # we'll simply continue polling the order until it has a certificate URL
+            logger.warning("Certificate URL not found in order, continuing to poll order status")
+            # Continue polling until we get a certificate URL or reach max attempts
+            for retry in range(10):
+                logger.info(f"Polling for certificate URL (attempt {retry+1}/10)")
+                time.sleep(5 * (retry + 1))  # Gradually increasing wait time
+                
+                # Get a fresh nonce if needed
+                try:
+                    head_response = self.session.head(self.directory["newNonce"])
+                    new_nonce = head_response.headers["Replay-Nonce"]
+                except Exception:
+                    logger.warning("Failed to get fresh nonce, continuing with existing one")
+                
+                # Try polling the order again
+                try:
+                    poll_resp = self.session.post(
+                        order_url,
+                        json=self.jws_sign(key, order_url, {}, new_nonce, post_as_get=True),
+                        headers={"Content-Type": "application/jose+json"}
+                    )
+                    
+                    if poll_resp.status_code != 200:
+                        logger.warning(f"Order polling failed with status {poll_resp.status_code}")
+                        continue
+                        
+                    new_nonce = poll_resp.headers["Replay-Nonce"]
+                    updated_order = poll_resp.json()
+                    
+                    if "certificate" in updated_order:
+                        certificate_url = updated_order["certificate"]
+                        logger.info(f"Found certificate URL: {certificate_url}")
+                        break
+                except Exception as e:
+                    logger.warning(f"Error polling order: {e}")
             
-            new_nonce = response.headers["Replay-Nonce"]
-            order = response.json()
+            # If we still don't have a certificate URL, try to use the 'Location' header from the finalize response
+            if certificate_url is None and "finalize" in order:
+                logger.warning("Still no certificate URL, waiting for certificate to be ready")
+                time.sleep(10)  # Give the server some more time
+                
+                # Try a final alternative approach using the Order ID
+                try:
+                    # Extract order ID from finalize URL
+                    if "/finalize/" in order["finalize"]:
+                        # Order ID is usually after /finalize/ in the URL
+                        parts = order["finalize"].split("/finalize/")
+                        if len(parts) >= 2:
+                            order_id = parts[1].split("/")[0]
+                            # Try to get the order directly using the order ID
+                            directory_url = self.directory_url.rstrip("/")
+                            direct_order_url = f"{directory_url}/order/{order_id}"
+                            logger.info(f"Attempting to get order directly: {direct_order_url}")
+                            
+                            # Get a fresh nonce
+                            head_response = self.session.head(self.directory["newNonce"])
+                            new_nonce = head_response.headers["Replay-Nonce"]
+                            
+                            # Get order
+                            order_resp = self.session.post(
+                                direct_order_url,
+                                json=self.jws_sign(key, direct_order_url, {}, new_nonce, post_as_get=True),
+                                headers={"Content-Type": "application/jose+json"}
+                            )
+                            
+                            if order_resp.status_code == 200:
+                                new_nonce = order_resp.headers["Replay-Nonce"]
+                                direct_order = order_resp.json()
+                                if "certificate" in direct_order:
+                                    certificate_url = direct_order["certificate"]
+                                    logger.info(f"Found certificate URL through direct order: {certificate_url}")
+                except Exception as e:
+                    logger.warning(f"Error getting direct order: {e}")
+                
+            # Last resort: use a constructed URL based on the finalize URL pattern
+            if certificate_url is None and "finalize" in order:
+                try:
+                    # Extract account ID and order ID from finalize URL
+                    # Format is typically: .../finalize/account_id/order_id
+                    finalize_parts = order["finalize"].split('/')
+                    if len(finalize_parts) >= 2:
+                        # Try to construct certificate URL based on ACME server patterns
+                        # For Let's Encrypt, it's often: .../cert/account_id/order_id
+                        account_id = finalize_parts[-2]
+                        order_id = finalize_parts[-1]
+                        base_url = '/'.join(finalize_parts[:-3])  # Remove finalize, account_id, and order_id
+                        possible_cert_url = f"{base_url}/cert/{account_id}/{order_id}"
+                        logger.warning(f"Last resort: Using constructed certificate URL: {possible_cert_url}")
+                        certificate_url = possible_cert_url
+                except Exception as e:
+                    logger.error(f"Failed to construct certificate URL: {e}")
             
-            if order["status"] == "valid" and "certificate" in order:
-                certificate_url = order["certificate"]
-                logger.info(f"Certificate ready: {certificate_url}")
-                break
-            elif order["status"] == "processing":
-                logger.info("Certificate processing, waiting 5 seconds")
-                time.sleep(5)
-            else:
-                logger.error(f"Unexpected order status: {order['status']}")
-                logger.error(json.dumps(order, indent=2))
-                raise ValueError(f"Unexpected order status: {order['status']}")
+            if certificate_url is None:
+                raise ValueError("Certificate URL not found in order and could not be determined")
         
         # Download the certificate
-        response = self.session.post(
-            certificate_url,
-            json=self.jws_sign(key, certificate_url, {}, new_nonce),
-            headers={"Content-Type": "application/jose+json"}
-        )
+        for dl_attempt in range(3):  # Multiple download attempts
+            try:
+                logger.info(f"Downloading certificate from: {certificate_url} (attempt {dl_attempt+1}/3)")
+                response = self.session.post(
+                    certificate_url,
+                    json=self.jws_sign(key, certificate_url, {}, new_nonce, post_as_get=True),
+                    headers={"Content-Type": "application/jose+json"}
+                )
+                
+                if response.status_code != 200:
+                    logger.error(f"Certificate download failed: {response.status_code}")
+                    logger.error(response.text)
+                    
+                    # Check for badNonce error
+                    try:
+                        error_data = response.json()
+                        if error_data.get("type") == "urn:ietf:params:acme:error:badNonce":
+                            logger.warning("Received badNonce error during certificate download, getting fresh nonce")
+                            # Get a fresh nonce
+                            head_response = self.session.head(self.directory["newNonce"])
+                            new_nonce = head_response.headers["Replay-Nonce"]
+                            logger.info(f"Got fresh nonce for certificate download: {new_nonce}")
+                            continue  # Retry immediately with new nonce
+                    except Exception:
+                        pass  # Fall through to standard retry logic
+                    
+                    if dl_attempt < 2:  # Try again if not the last attempt
+                        time.sleep(5)
+                        continue
+                    else:
+                        raise ValueError(f"Certificate download failed: {response.status_code}")
+                
+                new_nonce = response.headers["Replay-Nonce"]
+                certificate_pem = response.text
+                
+                # Validate the certificate has the correct format
+                if not certificate_pem or not certificate_pem.strip().startswith("-----BEGIN CERTIFICATE-----"):
+                    logger.warning(f"Downloaded certificate doesn't have expected format (attempt {dl_attempt+1}/3)")
+                    if dl_attempt < 2:  # Try again if not the last attempt
+                        time.sleep(5)
+                        continue
+                    else:
+                        raise ValueError("Invalid certificate format received")
+                
+                logger.info("Certificate downloaded successfully")
+                return new_nonce, certificate_pem
+            
+            except Exception as e:
+                logger.error(f"Error downloading certificate (attempt {dl_attempt+1}/3): {e}")
+                if dl_attempt < 2:  # Try again if not the last attempt
+                    time.sleep(5)
+                else:
+                    raise
         
-        if response.status_code != 200:
-            logger.error(f"Certificate download failed: {response.status_code}")
-            logger.error(response.text)
-            raise ValueError(f"Certificate download failed: {response.status_code}")
-        
-        new_nonce = response.headers["Replay-Nonce"]
-        certificate_pem = response.text
-        
-        logger.info("Certificate downloaded successfully")
-        return new_nonce, certificate_pem
+        # Should not reach here, but just in case
+        raise ValueError("Failed to download certificate after multiple attempts")
 
     def get_certificate(self) -> bool:
         """
@@ -583,21 +1016,40 @@ class ACMEClient:
                 # Finalize the order
                 nonce, finalized_order = self.finalize_order(account_key, order, nonce)
                 
-                # Wait for and download the certificate
-                nonce, certificate_pem = self.wait_for_certificate(account_key, finalized_order, nonce)
-                
-                # Save the certificate
-                with open(self.cert_path, 'w') as f:
-                    f.write(certificate_pem)
-                
-                # Verify that the certificate is valid
                 try:
-                    import ssl
-                    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-                    context.load_cert_chain(self.cert_path, self.domain_key_path)
-                    logger.info("Successfully loaded certificate")
-                except Exception as e:
-                    logger.error(f"Certificate verification failed: {e}")
+                    # Wait for and download the certificate
+                    nonce, certificate_pem = self.wait_for_certificate(account_key, finalized_order, nonce)
+                    
+                    # Verify the certificate has valid content
+                    if not certificate_pem or not certificate_pem.strip().startswith("-----BEGIN CERTIFICATE-----"):
+                        logger.error("Invalid certificate received - does not start with BEGIN CERTIFICATE")
+                        logger.debug(f"Certificate content (first 100 chars): {certificate_pem[:100] if certificate_pem else 'None'}")
+                        raise ValueError("Invalid certificate format received from ACME server")
+                    
+                    # Save the certificate
+                    with open(self.cert_path, 'w') as f:
+                        f.write(certificate_pem)
+                    
+                    # Verify that the certificate is valid
+                    try:
+                        import ssl
+                        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                        context.load_cert_chain(self.cert_path, self.domain_key_path)
+                        logger.info("Successfully loaded certificate")
+                    except Exception as e:
+                        logger.error(f"Certificate verification failed: {e}")
+                        # If it failed verification, try to provide better error info
+                        if "no start line" in str(e).lower():
+                            with open(self.cert_path, 'r') as f:
+                                cert_content = f.read(200)  # Just read the first part to check
+                            logger.error(f"Certificate appears to be in wrong format. First 200 chars: {cert_content}")
+                        os.remove(self.cert_path)  # Remove invalid certificate
+                        raise
+                except Exception as cert_e:
+                    logger.error(f"Error obtaining or verifying certificate: {cert_e}")
+                    # Clean up any bad certificate files to prevent "no start line" errors
+                    if os.path.exists(self.cert_path):
+                        os.remove(self.cert_path)
                     raise
                 
                 logger.info(f"Certificate saved to {self.cert_path}")

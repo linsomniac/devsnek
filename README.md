@@ -1,16 +1,18 @@
 # devsnek
 
-A Python development web server with automatic LetsEncrypt certificate support and ASGI capabilities.
+A Python development web server with automatic LetsEncrypt certificate support and ASGI capabilities. Simplifies secure local development with automatic certificate management.
 
 ## Features
 
 - Automatic HTTPS with LetsEncrypt certificates
+- Self-signed certificate fallback for quick local development
+- Comprehensive DNS validation and troubleshooting
 - Option to use LetsEncrypt staging environment for development
 - Static file serving (similar to `python -m http.server`)
 - ASGI application server with live reloading
 - WebSocket support
 - YAML configuration
-- HTTP to HTTPS redirection
+- Automatic HTTP to HTTPS redirection with smart port fallback
 
 ## Installation
 
@@ -75,6 +77,26 @@ devsnek --bind-addr localhost --port 8443 --http-port 8081
 # Combine with certificate options
 devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --http-port 8081
 ```
+
+The server now includes smart port fallback - if the specified HTTP port is in use, it will automatically try to find an available port nearby.
+
+### DNS Validation and Troubleshooting
+
+devsnek includes enhanced DNS validation to help you diagnose common Let's Encrypt certificate issues:
+
+```bash
+# Use verbose mode to see detailed DNS and certificate debugging information
+devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --verbose
+
+# For domains behind CDNs or proxies (like Cloudflare)
+devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --skip-port-check
+```
+
+The DNS validation system will:
+- Detect if your domain resolves to your server's public IP
+- Identify if your domain is behind a CDN or proxy
+- Diagnose common certificate acquisition failures
+- Provide actionable troubleshooting steps
 
 ### Debugging Options
 
