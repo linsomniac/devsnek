@@ -51,28 +51,38 @@ class DevServer:
         else:
             raise TypeError(f"Unsupported config type: {type(config)}")
         
-        # Initialize certificate manager
+        # Initialize certificate manager with SAN domains
+        # Only include SAN domains in the certificate (not the bind address)
+        cert_domains = self.config.san_domains if self.config.san_domains else ["localhost"]
         self.cert_manager = CertificateManager(
-            domains=[self.config.host] + self.config.san_domains,
+            domains=cert_domains,
             email=self.config.email,
             certs_dir=self.config.certs_dir,
             staging=self.config.staging,
+            self_signed=self.config.self_signed,
+            skip_port_check=self.config.skip_port_check,
         )
         
         # Initialize handlers
+        self.reload_task = None
         if self.config.asgi_app:
             self.handler = ASGIHandler(self.config.asgi_app)
-            self.reload_task = None
         else:
             self.handler = StaticFileHandler(self.config.web_root)
-            self.reload_task = None
         
         # Redirector for HTTP to HTTPS
         self.redirector = None
         if self.config.redirect_http:
+            # Use the primary certificate domain for redirection if available
+            # This ensures that redirects go to a domain name in the certificate
+            redirect_host = self.cert_manager.primary_domain
+            if redirect_host == "localhost" and self.config.bind_addr != "localhost":
+                redirect_host = self.config.bind_addr
+                
             self.redirector = HTTPToHTTPSRedirector(
-                target_host=self.config.host,
+                target_host=redirect_host,
                 target_port=self.config.port,
+                listen_port=self.config.http_port,
             )
     
     async def start(self):
@@ -90,7 +100,7 @@ class DevServer:
         # Start HTTPS server
         https_server = await asyncio.start_server(
             self.handle_client,
-            self.config.host,
+            self.config.bind_addr,
             self.config.port,
             ssl=ssl_context,
         )
@@ -106,7 +116,14 @@ class DevServer:
             )
         
         # Log server start
-        logger.info(f"Server running at https://{self.config.host}:{self.config.port}")
+        # Use primary domain from certificate if available
+        primary_domain = self.cert_manager.primary_domain
+        bind_info = f"{self.config.bind_addr}:{self.config.port}"
+        domain_info = f"{primary_domain}:{self.config.port}" if primary_domain != "localhost" else bind_info
+        
+        logger.info(f"Server running at https://{bind_info}")
+        if primary_domain != "localhost" and self.config.bind_addr != primary_domain:
+            logger.info(f"Certificate issued for: {primary_domain} (access via https://{domain_info})")
         
         try:
             async with https_server:

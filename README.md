@@ -31,49 +31,89 @@ pip install -e ".[fastapi]"
 
 ```bash
 # Serve static files (from ./web directory by default)
-devsnek --host example.com --port 8443
+devsnek --bind-addr localhost --port 8443
 ```
 
 ### ASGI Application Server
 
 ```bash
 # Run an ASGI application (with live reloading)
-devsnek --host example.com --port 8443 --asgi-app myapp:app
+devsnek --bind-addr localhost --port 8443 --asgi-app myapp:app
 ```
 
-### With Let's Encrypt Certificates
+### Certificate Options
 
 ```bash
+# Use self-signed certificate (default when no SAN domains are provided)
+devsnek --bind-addr localhost --port 8443 --self-signed
+
+# Use Let's Encrypt with specific domain names
+devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --san www.example.com
+
+# Include IP addresses in certificate (only works with self-signed)
+devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --san 192.168.1.10
+
 # Use Let's Encrypt staging for testing
-devsnek --host example.com --port 8443 --staging
+devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --staging
 
 # Use production Let's Encrypt with your email
-devsnek --host example.com --email admin@example.com
+devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --email admin@example.com
+
+# Skip port 80 availability check (for setups with proxies/port forwarding)
+devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --skip-port-check
+```
+
+### HTTP to HTTPS Redirection Options
+
+```bash
+# Disable HTTP redirection
+devsnek --bind-addr localhost --port 8443 --no-redirect
+
+# Use a custom HTTP port (if port 8080 is already in use)
+devsnek --bind-addr localhost --port 8443 --http-port 8081
+
+# Combine with certificate options
+devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --http-port 8081
+```
+
+### Debugging Options
+
+```bash
+# Enable verbose output to see detailed certificate processing
+devsnek --bind-addr localhost --port 8443 --verbose
+
+# Set custom logging level
+devsnek --bind-addr localhost --port 8443 --log-level DEBUG
+
+# Debug Let's Encrypt certificate issues
+devsnek --bind-addr 0.0.0.0 --port 8443 --san example.com --verbose
 ```
 
 ## Usage
 
 ```
-usage: devsnek [-h] [--host HOST] [--port PORT] [--certs-dir CERTS_DIR] [--email EMAIL] [--san SAN] [--staging]
-                [--web-root WEB_ROOT] [--asgi-app ASGI_APP] [--no-redirect] [--redirect-port REDIRECT_PORT]
-                [--no-reload] [--reload-dir RELOAD_DIRS] [--no-websocket]
-                [--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}] [--config CONFIG] [--save-config SAVE_CONFIG]
+usage: devsnek [-h] [--bind-addr BIND_ADDR] [--port PORT] [--certs-dir CERTS_DIR] [--email EMAIL] 
+                [--san SAN] [--staging] [--self-signed] [--web-root WEB_ROOT] [--asgi-app ASGI_APP] 
+                [--no-redirect] [--redirect-port REDIRECT_PORT] [--no-reload] [--reload-dir RELOAD_DIRS] 
+                [--no-websocket] [--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}] [--config CONFIG] 
+                [--save-config SAVE_CONFIG]
 
 devsnek: Python development web server with LetsEncrypt support
 
 options:
   -h, --help            show this help message and exit
-  --host HOST           Host to bind to (default: localhost)
+  --bind-addr BIND_ADDR Address to bind to (default: localhost)
   --port PORT           Port to bind to (default: 8443)
   --certs-dir CERTS_DIR
                         Directory to store certificates (default: certs)
   --email EMAIL         Email address for Let's Encrypt registration
-  --san SAN             Subject Alternative Name(s) to include in the certificate
+  --san SAN             Subject Alternative Name(s) to include in the certificate (domain or IP)
   --staging             Use Let's Encrypt staging environment
+  --self-signed         Use self-signed certificate (default when no SAN domains are provided)
   --web-root WEB_ROOT   Directory to serve static files from (default: web)
   --asgi-app ASGI_APP   ASGI application to run (format: module:app)
   --no-redirect         Disable HTTP to HTTPS redirection
-  --redirect-port REDIRECT_PORT
+  --http-port HTTP_PORT  Port to listen on for HTTP redirection (default: 8080)
                         Port to listen on for HTTP redirection (default: 8080)
   --no-reload           Disable live reloading for ASGI applications
   --reload-dir RELOAD_DIRS

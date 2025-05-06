@@ -12,7 +12,7 @@ class ServerConfig:
     """Configuration for the development server."""
     
     # Server basics
-    host: str = "localhost"
+    bind_addr: str = "localhost"
     port: int = 8443
     
     # Certificate configuration
@@ -20,6 +20,8 @@ class ServerConfig:
     email: Optional[str] = None
     san_domains: List[str] = field(default_factory=list)
     staging: bool = False
+    self_signed: bool = False
+    skip_port_check: bool = False
     
     # Static file serving
     web_root: str = "web"
@@ -29,7 +31,7 @@ class ServerConfig:
     
     # HTTP to HTTPS redirection
     redirect_http: bool = True
-    redirect_port: int = 8080
+    http_port: int = 8080
     
     # Live reload
     live_reload: bool = True
@@ -40,6 +42,7 @@ class ServerConfig:
     
     # Logging
     log_level: str = "INFO"
+    verbose: bool = False
     
 
 def load_config(config_path: str) -> ServerConfig:

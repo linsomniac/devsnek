@@ -27,6 +27,8 @@ class HTTPToHTTPSRedirector:
         self.target_port = target_port
         self.listen_port = listen_port
         self.server = None
+        
+        logger.info(f"HTTP redirector will listen on port {self.listen_port} and redirect to https://{self.target_host}:{self.target_port}")
     
     async def start(self):
         """Start the redirector server."""
@@ -42,6 +44,12 @@ class HTTPToHTTPSRedirector:
             # Start serving in the background
             asyncio.create_task(self.server.serve_forever())
         
+        except OSError as e:
+            if e.errno == 98:  # Address already in use
+                logger.error(f"Failed to start HTTP redirector: Port {self.listen_port} is already in use. "
+                           f"Use --http-port to specify a different port or --no-redirect to disable redirection.")
+            else:
+                logger.error(f"Failed to start HTTP redirector: {e}")
         except Exception as e:
             logger.error(f"Failed to start HTTP redirector: {e}")
     
